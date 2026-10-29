@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
+    DraftBand,
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -144,6 +145,69 @@ def _capacities(bundle) -> dict:
 class TestUnifiedPostCaptureSizing(unittest.TestCase):
     def setUp(self):
         setup_allocator_context()
+
+    def test_auxiliary_host_pool_attaches_to_its_own_cache_component(self):
+        """A separately retained draft window must survive final HiCache attachment."""
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as host
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.runtime_context import get_memory
+
+        region = DenseDraftRegion(
+            lane_num=1, head_num=1, head_dim=8, store_dtype=torch.float16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={"draft_swa": region},
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        bundle = _bundle(
+            total_bytes=1 << 20,
+            post_capture_active=False,
+            chain="swa",
+            fused_draft=placement,
+        )
+        a = bundle.token_to_kv_pool_allocator
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=bundle.storage.requests,
+            token_to_kv_pool_allocator=a,
+            page_size=4,
+            sliding_window_size=64,
+            tree_slots=bundle.storage.tree_slots(),
+            tree_core_backend="python",
+        )
+        cache = UnifiedRadixCache(params)
+        # The IO controller starts background transfer workers; keep the real
+        # device/host layouts, component tree and final attachment in this test.
+        controller = SimpleNamespace(layer_done_counter=None, transfer_layer_id_max=4)
+        with (
+            get_memory().override(
+                hicache_ratio=1.0, hicache_size=0, hicache_mem_layout="layer_first"
+            ),
+            patch.object(host, "HybridCacheController", return_value=controller),
+        ):
+            host.attach_hybrid_pool_to_unified_cache(
+                cache, params, None, load_cache_event=None
+            )
+        pools = (
+            cache.full_kv_pool_host,
+            cache.swa_kv_pool_host,
+            cache.auxiliary_swa_kv_pool_host,
+        )
+        for pool in pools:
+            self.addCleanup(pool.destroy)
+        self.assertIsNot(pools[1], pools[2])
+        self.assertIs(cache.components[ComponentType.SWA]._swa_kv_pool_host, pools[1])
+        self.assertIs(
+            cache.components[ComponentType.AUXILIARY_SWA]._swa_kv_pool_host, pools[2]
+        )
+        ids = pools[2].alloc(4)
+        self.assertIsNotNone(ids)
+        pools[2].free(ids)
 
     def _post_capture_bundle(self, total_bytes=_RESERVED_BYTES):
         return _bundle(total_bytes=total_bytes, post_capture_active=True)
@@ -362,6 +426,187 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
                         lo = row * spec.entry_bytes() + part.layer_offset_bytes(1)
                         changed[lo : lo + part.row_bytes()] = True
                 self.assertTrue(torch.equal(arena.raw[~changed], before[~changed]))
+
+    def test_replicated_draft_graph_refreshes_after_owner_compaction(self):
+        from sglang.srt.mem_cache.kv.alloc.id_space import ReplicatedTokenIds
+
+        for factor in (2, 4):
+            with (
+                self.subTest(dcp=factor),
+                get_parallel().override(attn_dcp_size=factor),
+            ):
+                region = DenseDraftRegion(
+                    lane_num=1,
+                    head_num=1,
+                    head_dim=3,
+                    v_head_dim=5,
+                    store_dtype=torch.float16,
+                    token_replicas=factor,
+                )
+                bundle = _bundle(
+                    total_bytes=1 << 20,
+                    post_capture_active=False,
+                    chain="state",
+                    fused_draft=FusedDraftPlacement.from_counts(
+                        counts={"full": [1]}, regions={"full": region}
+                    ),
+                )
+                alloc = bundle.token_to_kv_pool_allocator
+                first = alloc.alloc(_PAGE_SIZE * factor)
+                live = alloc.alloc(_PAGE_SIZE * factor)
+                coords = ReplicatedTokenIds(alloc.full_attn_allocator.ids, factor)
+                space = coords.space("full")
+                view = DraftMHAView(
+                    arena=bundle.arena,
+                    host_spec=bundle.storage.plan.owner().spec,
+                    layer_lanes={0: 0},
+                    page_size=_PAGE_SIZE,
+                )
+                k = torch.arange(
+                    live.numel() * 3, device="cuda", dtype=torch.float16
+                ).reshape(-1, 1, 3)
+                v = torch.arange(
+                    live.numel() * 5, device="cuda", dtype=torch.float16
+                ).reshape(-1, 1, 5)
+                layer = SimpleNamespace(layer_id=0)
+                # Compile both kernels before capture.
+                coords.refresh()
+                view.set_kv_buffer(
+                    layer, KVWriteLoc(coords.write(live), physical=True), k, v
+                )
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    coords.refresh()
+                    loc = coords.write(live)
+                    view.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
+                pointer = space.read_v2p.data_ptr()
+                before = coords.write(live).clone()
+                alloc.free(first)
+                k.add_(7)
+                v.add_(11)
+                graph.replay()
+                torch.cuda.synchronize()
+                after = coords.write(live)
+                self.assertFalse(torch.equal(before, after))
+                torch.testing.assert_close(view.k_buffer[0][after.long()], k)
+                torch.testing.assert_close(view.v_buffer[0][after.long()], v)
+                virtual_pages = live[::_PAGE_SIZE] // _PAGE_SIZE
+                torch.testing.assert_close(
+                    space.read_v2p[virtual_pages.long()],
+                    after[::_PAGE_SIZE] // _PAGE_SIZE,
+                )
+                self.assertEqual(space.read_v2p.data_ptr(), pointer)
+                alloc.free(live)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
+
+    def test_dcp_host_pages_preserve_owner_and_draft_window_bytes(self):
+        from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
+
+        for factor in (1, 2, 4):
+            with (
+                self.subTest(dcp=factor),
+                get_parallel().override(attn_dcp_size=factor),
+            ):
+                region = DenseDraftRegion(
+                    lane_num=1,
+                    head_num=1,
+                    head_dim=3,
+                    v_head_dim=5,
+                    store_dtype=torch.float16,
+                    token_replicas=factor,
+                )
+                placement = FusedDraftPlacement.from_counts(
+                    counts={"full": [1], "swa": [1]},
+                    regions={"full": region, "swa": region},
+                    new_bands={"swa": DraftBand(kind="window", window=32)},
+                )
+                bundle = _bundle(
+                    total_bytes=1 << 20,
+                    post_capture_active=False,
+                    chain="state",
+                    fused_draft=placement,
+                )
+                alloc = bundle.token_to_kv_pool_allocator
+                storage = alloc.storage
+                ids = alloc.alloc(8 * factor)
+                for name in ("full", "swa"):
+                    layout = storage.host_layout(name)
+                    host = layout.build(
+                        HostPoolOptions(
+                            ratio=1,
+                            size=0,
+                            page_size=alloc.page_size,
+                            layout="layer_first",
+                            allocator_type="default",
+                            pool_label=name,
+                        )
+                    )
+                    host_ids = host.alloc(ids.numel())
+                    translate = storage.host_ids(name)
+                    device_ids = (
+                        translate(ids)
+                        if translate is not None
+                        else storage.window_ids(name, ids)
+                    )
+                    pages = device_ids[:: alloc.page_size] // alloc.page_size
+                    buffer = layout.get_page_envelope_buffer()
+                    buffer[pages] = 29
+                    expected = buffer[pages].clone()
+                    host.backup_from_device_all_layer(
+                        layout, host_ids, device_ids, "kernel"
+                    )
+                    torch.cuda.synchronize()
+                    buffer[pages] = 0
+                    host.load_to_device_per_layer(
+                        layout, host_ids, device_ids, 0, "kernel"
+                    )
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(buffer[pages], expected)
+                    host.free(host_ids)
+                    host.destroy()
+                alloc.free(ids)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
+
+    def test_two_window_chain_resizes_after_capture(self):
+        region = DenseDraftRegion(
+            lane_num=1, head_num=1, head_dim=3, v_head_dim=5, store_dtype=torch.float16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={"draft_swa": region},
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        captured = _bundle(
+            total_bytes=_RESERVED_BYTES,
+            post_capture_active=True,
+            chain="tri",
+            fused_draft=placement,
+        )
+        alloc = captured.token_to_kv_pool_allocator
+        graph = torch.cuda.CUDAGraph()
+        pointer = captured.arena.raw.data_ptr()
+        with torch.cuda.graph(graph):
+            captured.arena.raw[:1].fill_(7)
+        config = _final_config(captured)
+        captured.token_to_kv_pool.finalize_backing(config)
+        alloc.resize(config)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(captured.arena.raw.data_ptr(), pointer)
+        self.assertEqual(captured.arena.raw[0].item(), 7)
+        eager = _bundle(
+            total_bytes=_FINAL_BYTES,
+            post_capture_active=False,
+            chain="tri",
+            fused_draft=placement,
+        )
+        self.assertEqual(
+            alloc.available_size(), eager.token_to_kv_pool_allocator.available_size()
+        )
+        ids = alloc.alloc(8)
+        self.assertIsNotNone(ids)
+        alloc.free(ids)
+        self.assertEqual(alloc.verify_byte_accounting(), [])
 
     def test_sizing_contract_is_enforced(self):
         bundle = self._post_capture_bundle()
